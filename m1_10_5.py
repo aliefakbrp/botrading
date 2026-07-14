@@ -19,9 +19,6 @@ MIN_MA_SPREAD = 5 * PIP_MULTIPLIER   # Minimal jarak MA5 & MA10
 SIDEWAYS_LOOKBACK = 5                # Jumlah candle tertutup untuk cek sideways
 MIN_MA_SLOPE = 3 * PIP_MULTIPLIER    # Minimal kemiringan MA agar tidak dianggap sideways
 HISTORY_LOOKBACK_MINUTES = 10        # Waktu cek history untuk deteksi posisi kena SL
-RSI_PERIOD = 14                      # Periode RSI untuk filter geser SL+
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
 
 # ==========================================
 # FUNGSI-FUNGSI PENDUKUNG
@@ -32,7 +29,7 @@ def initialize_mt5():
         quit()
     print("Berhasil terhubung ke MT5!")
 
-def get_data(symbol, timeframe, n_candles=30):
+def get_data(symbol, timeframe, n_candles=15):
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n_candles)
     if rates is None:
         return None
@@ -41,11 +38,6 @@ def get_data(symbol, timeframe, n_candles=30):
     df['time'] = pd.to_datetime(df['time'], unit='s')
     df['ma5'] = df['close'].rolling(window=5).mean()
     df['ma10'] = df['close'].rolling(window=10).mean()
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0).rolling(window=RSI_PERIOD).mean()
-    loss = (-delta.clip(upper=0)).rolling(window=RSI_PERIOD).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
     return df
 
 def get_active_positions(symbol):
@@ -78,20 +70,6 @@ def get_order_label(order_type):
 
 def get_reverse_order_label(order_type):
     return "SELL" if order_type == mt5.ORDER_TYPE_BUY else "BUY"
-
-def can_move_trailing_sl(position, last_candle):
-    rsi = last_candle['rsi']
-    if pd.isna(rsi):
-        return False
-
-    candle_bullish = last_candle['close'] > last_candle['open']
-    candle_bearish = last_candle['close'] < last_candle['open']
-
-    if position.type == mt5.ORDER_TYPE_BUY:
-        return rsi >= RSI_OVERBOUGHT and candle_bearish
-    if position.type == mt5.ORDER_TYPE_SELL:
-        return rsi <= RSI_OVERSOLD and candle_bullish
-    return False
 
 def is_engulfing_candle(df):
     if len(df) < 3:
@@ -357,11 +335,7 @@ def run_bot():
                 
                 # Trailing Stop Management
                 else:
-                    sl_filter_ready = can_move_trailing_sl(pos, last_candle)
-                    if not sl_filter_ready:
-                        print(f"SL+ belum digeser. RSI: {last_candle['rsi']:.2f}, candle belum konfirmasi balik arah.")
-
-                    if pos.type == mt5.ORDER_TYPE_BUY and sl_filter_ready:
+                    if pos.type == mt5.ORDER_TYPE_BUY:
                         new_sl = tick.bid - TRAILING_STEP
                         new_sl = round(new_sl, digits) 
                         if tick.bid - pos.price_open > TRAILING_STEP and new_sl > pos.sl:
@@ -371,10 +345,10 @@ def run_bot():
                             if result.retcode == mt5.TRADE_RETCODE_DONE:
                                 print(
                                     f"SL BUY digeser: {old_sl:.{digits}f} -> {new_sl:.{digits}f} | "
-                                    f"Current: {tick.bid:.{digits}f} | RSI: {last_candle['rsi']:.2f} | PnL: {pos.profit:.2f}"
+                                    f"Current: {tick.bid:.{digits}f} | PnL: {pos.profit:.2f}"
                                 )
                             
-                    elif pos.type == mt5.ORDER_TYPE_SELL and sl_filter_ready:
+                    elif pos.type == mt5.ORDER_TYPE_SELL:
                         new_sl = tick.ask + TRAILING_STEP
                         new_sl = round(new_sl, digits) 
                         if pos.price_open - tick.ask > TRAILING_STEP and (new_sl < pos.sl or pos.sl == 0.0):
@@ -384,7 +358,7 @@ def run_bot():
                             if result.retcode == mt5.TRADE_RETCODE_DONE:
                                 print(
                                     f"SL SELL digeser: {old_sl:.{digits}f} -> {new_sl:.{digits}f} | "
-                                    f"Current: {tick.ask:.{digits}f} | RSI: {last_candle['rsi']:.2f} | PnL: {pos.profit:.2f}"
+                                    f"Current: {tick.ask:.{digits}f} | PnL: {pos.profit:.2f}"
                                 )
 
             elif len(positions) > 1:
