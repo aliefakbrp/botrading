@@ -6,7 +6,7 @@ import pandas as pd
 
 
 SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSDm")
-TIMEFRAME = mt5.TIMEFRAME_M1
+TIMEFRAME = mt5.TIMEFRAME_H1
 LOT = float(os.getenv("MT5_LOT", "0.01"))
 MAGIC = int(os.getenv("MT5_MAGIC", "51011"))
 DEVIATION = int(os.getenv("MT5_DEVIATION", "20"))
@@ -17,9 +17,9 @@ ATR_PERIOD = int(os.getenv("MT5_ATR_PERIOD", "14"))
 MIN_TREND_EFFICIENCY = float(os.getenv("MT5_MIN_TREND_EFFICIENCY", "0.30"))
 MIN_MA10_SLOPE_ATR = float(os.getenv("MT5_MIN_MA10_SLOPE_ATR", "0.50"))
 MIN_ENGULFING_BODY_ATR = float(os.getenv("MT5_MIN_ENGULFING_BODY_ATR", "0.10"))
-MAX_ENTRIES_PER_DIRECTION = int(os.getenv("MT5_MAX_ENTRIES", "3"))
-TRAILING_START_POINTS = int(os.getenv("MT5_TRAILING_START_POINTS", "50"))
-TRAILING_DISTANCE_POINTS = int(os.getenv("MT5_TRAILING_DISTANCE_POINTS", "50"))
+SWING_LOOKBACK = int(os.getenv("MT5_SWING_LOOKBACK", "30"))
+TP_SHIFT_TRIGGER_POINTS = int(os.getenv("MT5_TP_SHIFT_TRIGGER_POINTS", "30"))
+TP_SHIFT_SL_POINTS = int(os.getenv("MT5_TP_SHIFT_SL_POINTS", "50"))
 
 
 def get_rates(count=100):
@@ -113,32 +113,6 @@ def engulfing_signal(df):
     return None, current
 
 
-def continuation_signal(df, positions):
-    previous = df.iloc[-3]
-    current = df.iloc[-2]
-    has_buy = any(position.type == mt5.POSITION_TYPE_BUY for position in positions)
-    has_sell = any(position.type == mt5.POSITION_TYPE_SELL for position in positions)
-
-    bullish_continuation = (
-        has_buy
-        and current["close"] > current["open"]
-        and current["close"] > previous["close"]
-        and current["close"] > current["ma5"]
-    )
-    bearish_continuation = (
-        has_sell
-        and current["close"] < current["open"]
-        and current["close"] < previous["close"]
-        and current["close"] < current["ma5"]
-    )
-
-    if bullish_continuation:
-        return "BUY", current
-    if bearish_continuation:
-        return "SELL", current
-    return None, current
-
-
 def bot_positions():
     positions = mt5.positions_get(symbol=SYMBOL)
     if positions is None:
@@ -162,6 +136,7 @@ def send_market_order(
     volume,
     position_ticket=None,
     sl=0.0,
+    tp=0.0,
     comment="MA5 MA10 Engulfing V2",
 ):
     tick = mt5.symbol_info_tick(SYMBOL)
@@ -188,6 +163,8 @@ def send_market_order(
         request["position"] = position_ticket
     if sl:
         request["sl"] = round(sl, info.digits)
+    if tp:
+        request["tp"] = round(tp, info.digits)
 
     result = mt5.order_send(request)
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
@@ -211,31 +188,34 @@ def close_position(position):
     )
 
 
-def manage_trailing_stop():
+def manage_trailing_stop(df):
     info = mt5.symbol_info(SYMBOL)
     tick = mt5.symbol_info_tick(SYMBOL)
     if info is None or tick is None:
         return
 
     minimum_distance = max(info.trade_stops_level, info.trade_freeze_level) * info.point
-    trailing_distance = max(
-        TRAILING_DISTANCE_POINTS * info.point,
-        minimum_distance + info.point,
-    )
-    trailing_start = max(TRAILING_START_POINTS * info.point, trailing_distance)
+    last_closed = df.iloc[-2]
+    ma5 = float(last_closed["ma5"])
+    if pd.isna(ma5):
+        return
 
     for position in bot_positions():
         if position.type == mt5.POSITION_TYPE_BUY:
-            if tick.bid - position.price_open < trailing_start:
+            new_sl = round(ma5, info.digits)
+            if tick.bid - new_sl < minimum_distance:
                 continue
-            new_sl = round(tick.bid - trailing_distance, info.digits)
             if position.sl > 0 and new_sl <= position.sl:
                 continue
-        else:
-            if position.price_open - tick.ask < trailing_start:
+            if new_sl <= position.price_open:
                 continue
-            new_sl = round(tick.ask + trailing_distance, info.digits)
+        else:
+            new_sl = round(ma5, info.digits)
+            if new_sl - tick.ask < minimum_distance:
+                continue
             if position.sl > 0 and new_sl >= position.sl:
+                continue
+            if new_sl >= position.price_open:
                 continue
 
         request = {
@@ -249,12 +229,39 @@ def manage_trailing_stop():
         result = mt5.order_send(request)
         if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
             print(
-                f"Trailing SL {position.ticket}: {position.sl:.{info.digits}f} "
+                f"Trailing SL MA5 {position.ticket}: {position.sl:.{info.digits}f} "
                 f"-> {new_sl:.{info.digits}f}"
             )
         else:
             error = mt5.last_error() if result is None else f"{result.retcode} - {result.comment}"
             print(f"Trailing SL gagal {position.ticket}: {error}")
+
+
+def modify_position_sl_tp(position, sl, tp, label):
+    info = mt5.symbol_info(SYMBOL)
+    if info is None:
+        return False
+
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": SYMBOL,
+        "position": position.ticket,
+        "sl": round(sl, info.digits) if sl else position.sl,
+        "tp": round(tp, info.digits) if tp else position.tp,
+        "magic": MAGIC,
+    }
+    result = mt5.order_send(request)
+    if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+        print(
+            f"{label} {position.ticket}: SL {position.sl:.{info.digits}f} "
+            f"-> {request['sl']:.{info.digits}f} | TP {position.tp:.{info.digits}f} "
+            f"-> {request['tp']:.{info.digits}f}"
+        )
+        return True
+
+    error = mt5.last_error() if result is None else f"{result.retcode} - {result.comment}"
+    print(f"{label} gagal {position.ticket}: {error}")
+    return False
 
 
 def calculate_sl(signal, candle):
@@ -274,35 +281,100 @@ def calculate_sl(signal, candle):
     return max(reference + buffer_distance, tick.bid + buffer_distance)
 
 
-def execute_signal(signal, candle, sideways):
+def find_swing_target(signal, df, reference_price):
+    info = mt5.symbol_info(SYMBOL)
+    if info is None:
+        return 0.0
+
+    minimum_distance = max(info.trade_stops_level, info.trade_freeze_level) * info.point
+    candles = df.iloc[:-1].tail(SWING_LOOKBACK).reset_index(drop=True)
+    if len(candles) < 3:
+        return 0.0
+
+    if signal == "BUY":
+        for i in range(len(candles) - 2, 0, -1):
+            high = float(candles.iloc[i]["high"])
+            previous_high = float(candles.iloc[i - 1]["high"])
+            next_high = float(candles.iloc[i + 1]["high"])
+            if high > previous_high and high > next_high and high > reference_price + minimum_distance:
+                return round(high, info.digits)
+        return 0.0
+
+    for i in range(len(candles) - 2, 0, -1):
+        low = float(candles.iloc[i]["low"])
+        previous_low = float(candles.iloc[i - 1]["low"])
+        next_low = float(candles.iloc[i + 1]["low"])
+        if low < previous_low and low < next_low and low < reference_price - minimum_distance:
+            return round(low, info.digits)
+    return 0.0
+
+
+def calculate_tp(signal, df, entry_price):
+    return find_swing_target(signal, df, entry_price)
+
+
+def manage_near_tp_shift(df):
+    info = mt5.symbol_info(SYMBOL)
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if info is None or tick is None:
+        return
+
+    minimum_distance = max(info.trade_stops_level, info.trade_freeze_level) * info.point
+    trigger_distance = max(TP_SHIFT_TRIGGER_POINTS * info.point, minimum_distance)
+    sl_distance = max(TP_SHIFT_SL_POINTS * info.point, minimum_distance + info.point)
+
+    for position in bot_positions():
+        if position.tp <= 0:
+            continue
+
+        if position.type == mt5.POSITION_TYPE_BUY:
+            distance_to_tp = position.tp - tick.bid
+            if distance_to_tp < 0 or distance_to_tp > trigger_distance:
+                continue
+
+            next_tp = find_swing_target("BUY", df, position.tp)
+            new_tp = next_tp if next_tp > position.tp else position.tp
+            new_sl = round(tick.bid - sl_distance, info.digits)
+            if position.sl > 0 and new_sl <= position.sl:
+                new_sl = position.sl
+            if tick.bid - new_sl < minimum_distance:
+                continue
+        else:
+            distance_to_tp = tick.ask - position.tp
+            if distance_to_tp < 0 or distance_to_tp > trigger_distance:
+                continue
+
+            next_tp = find_swing_target("SELL", df, position.tp)
+            new_tp = next_tp if next_tp and next_tp < position.tp else position.tp
+            new_sl = round(tick.ask + sl_distance, info.digits)
+            if position.sl > 0 and new_sl >= position.sl:
+                new_sl = position.sl
+            if new_sl - tick.ask < minimum_distance:
+                continue
+
+        if new_sl != position.sl or new_tp != position.tp:
+            modify_position_sl_tp(position, new_sl, new_tp, "TP shift")
+
+
+def execute_signal(signal, candle, sideways, df):
     if sideways:
         print(f"{candle['time']} | {signal} engulfing diabaikan: market sideways")
         return
 
-    desired_type = (
-        mt5.POSITION_TYPE_BUY if signal == "BUY" else mt5.POSITION_TYPE_SELL
-    )
     positions = bot_positions()
-    same_direction = [
-        position for position in positions if position.type == desired_type
-    ]
-    total_same_volume = sum(position.volume for position in same_direction)
-    maximum_volume = LOT * MAX_ENTRIES_PER_DIRECTION
-
-    if total_same_volume + (LOT / 2) >= maximum_volume:
-        print(f"{candle['time']} | Batas {MAX_ENTRIES_PER_DIRECTION} entry {signal} tercapai")
+    if positions:
+        print(f"{candle['time']} | Sinyal {signal} diabaikan: masih ada posisi aktif")
         return
-
-    for position in positions:
-        if position.type != desired_type and not close_position(position):
-            return
 
     sl = calculate_sl(signal, candle)
     order_type = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
-    if send_market_order(order_type, LOT, sl=sl):
+    tick = mt5.symbol_info_tick(SYMBOL)
+    entry_price = tick.ask if signal == "BUY" else tick.bid
+    tp = calculate_tp(signal, df, entry_price)
+    if send_market_order(order_type, LOT, sl=sl, tp=tp):
         print(
             f"{candle['time']} | {signal} ENGULFING | close={candle['close']:.3f} "
-            f"MA5={candle['ma5']:.3f} MA10={candle['ma10']:.3f} SL={sl:.3f}"
+            f"MA5={candle['ma5']:.3f} MA10={candle['ma10']:.3f} SL={sl:.3f} TP={tp:.3f}"
         )
 
 
@@ -314,7 +386,7 @@ def main():
         if not mt5.symbol_select(SYMBOL, True):
             raise RuntimeError(f"Symbol {SYMBOL} tidak tersedia")
 
-        print(f"Bot V2 aktif: {SYMBOL} M1 | SMA5/SMA10 + Engulfing + Sideways")
+        print(f"Bot V2 aktif: {SYMBOL} H1 | SMA5/SMA10 + Engulfing + Sideways")
         last_processed_candle = None
 
         while True:
@@ -323,17 +395,15 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            manage_trailing_stop()
-            positions = bot_positions()
+            manage_trailing_stop(df)
+            manage_near_tp_shift(df)
             signal, candle = engulfing_signal(df)
-            if signal is None:
-                signal, candle = continuation_signal(df, positions)
             candle_time = candle["time"]
 
             if candle_time != last_processed_candle:
                 last_processed_candle = candle_time
                 if signal is not None:
-                    execute_signal(signal, candle, is_sideways(df))
+                    execute_signal(signal, candle, is_sideways(df), df)
 
             time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
